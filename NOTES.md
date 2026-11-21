@@ -1,115 +1,44 @@
-# Trophy earn-rate forecaster — gta6-trophy-rarity-forecast-01
+# Trophy earn-rate forecaster
 
-`main.py`, Python 3.13, standard library only, no network. One JSON forecast per case:
-five quantiles (0.05/0.25/0.50/0.75/0.95) of each trophy's Exophase earn rate at the
-case's target, on the logit scale the pinball loss scores.
+`main.py` — Python 3.13, standard library only, no network. Reads every `*.in`
+from `$MAKEFUN_INPUT_DIR` (else `/input/`) in name order, writes
+`$MAKEFUN_OUTPUT_DIR/<id>.out` (else `/output/`). Run: `python3 -P -s main.py`.
 
-## What the model does
+## The model (five lines)
 
-Per trophy, on `l = ln(r/(100-r))` (fit clamp 0.05..99.95, output clamp 0.01..99.99):
+1. Logit space: `lg(r)=ln(clamp(r,0.05,99.95)/(100-clamp(r,0.05,99.95)))`, `inv(x)=100/(1+exp(-x))`; `base_sigma=0.5*sqrt(max(h_days,1e-6))`, `h_days=horizon_minutes/1440`.
+2. Median: decay-weighted (`0.85**(n-1-k)`) line of logit-rate vs minutes-since-first-read, evaluated at `target`; `drift=fit-lg(last_rate)`, clamped to `±1.2*sqrt(h_days)`, shrunk by `w=n/(n+6)`; `median=lg(last_rate)+w*drift`.
+3. Boundary: a last read of 0/100 carries the last interior read forward (frozen stays frozen); an all-boundary series emits `lg(last_rate)` with `base_sigma`.
+4. Spread: `granularity=0.5/max(last_rate/100*players_tracked,0.5)`; `sigma=min(max(base_sigma,base_sigma*(1+granularity)),1.6*base_sigma)` — never narrower than base, never wider than 1.6×.
+5. Quantiles at `z=-1.6449,-0.6745,0,0.6745,1.6449` around the median, back to percent, half-up to 4 decimals, clamped `0.01..99.99`, forced non-decreasing; one row per id 1..55.
 
-1. **Trend** — OLS line over the last up to 8 non-null reads (minutes since first read),
-   extrapolated to `target`.
-2. **Shrinkage** — `w = n_eff/(n_eff+5)`, further gated by the fit's t-statistic
-   (`t/(t+2)`), so thin or noisy histories fall back toward persistence; a flat history
-   has slope 0 and does not move.
-3. **Drift cap** — extrapolated logit change clamped to ±`1.2*sqrt(horizon_days)`;
-   median rate clamped to 0.01..99.99. Platinum additionally never forecasts above the
-   cheapest other trophy's median (it logically requires every other trophy).
-4. **Spread** — per-tier random-walk scale from the case's own consecutive logit steps,
-   each normalized by `sqrt(gap)` and aggregated as **RMS** (not median-absolute: the
-   page sits unchanged between Exophase refreshes, so most steps are 0 and the median
-   would throw the refresh jumps' energy away). Scaled by `sqrt(horizon_minutes)`,
-   floored at the baseline's `0.5*sqrt(horizon_days)`, combined in quadrature with the
-   fit's extrapolation standard error (capped 1.5; total capped 3.0). Quantiles at
-   z = −1.645, −0.674, 0, 0.674, 1.645.
-5. **Tier prior** — with <4 reads the slope blends 30% toward the tier's median slope
-   (weak prior, never a hard rule).
-6. **Stale-launch refresh** — the practice's shape: every read identical (page never
-   refreshed), game within 30 h of release, tracked population ≤ 5000. The next refresh
-   then reveals launch growth accumulated while the page was stale: median shifts by
-   `−ln(G)*(1 − r/100)` where `G = 2^((staleness_h + 0.5 + horizon_h)/2.2)` capped at 12×
-   (doubling ~2.2 h on launch night), and the spread widens by `0.45*ln(G)` in quadrature
-   for growth uncertainty. A trophy already at 100% stays pinned at 99.99 with a small
-   spread (the documented refresh left the 100% rate at 100%). The gate is **off whenever
-   any read differs** — the final's dynamic history never triggers it.
+## Backtest numbers
 
-Shape guarantees: one row per id, non-decreasing after half-up 4-decimal rounding,
-every rate in 0.01..99.99, compact JSON. Any unexpected error falls back to the
-persistence baseline for that case, so a case is never invalid.
-
-## Measurement — what was possible, and the numbers
-
-**`grade-local` cannot grade this kit.** Run as instructed:
+`python3 /var/tmp/backtest_rarity.py /var/tmp/rarity-practice /var/tmp/rarity`
+(truncate the last read, predict it, score pinball on the logit scale):
 
 ```
-cd …/gta6-trophy-rarity-forecast-01-kit && node cli/makefun.mjs grade-local --kit . --bot /var/tmp/rarity --driver process
-→ "gta6-trophy-rarity-forecast-01 is a program/v1 competition: its scorer and reference
-   data are not published in the kit, so it is graded on the server only"
+base: mean pinball 0.007176  n=110
+ours: mean pinball 0.007849  n=110   (threshold <= 0.0085 -> PASS)
+improvement: -0.000673 (-9.4%)
 ```
 
-The practice answers are sealed server-side; no submission was made (out of scope for
-this task). Local measurement therefore uses:
+Practice shape/median check: 55 rows, five non-decreasing quantiles each,
+worst median vs last read **0.0005** (< 0.02). Outputs 2,654 bytes/case
+(< 65,536). The small negative "improvement" is expected and correct: on a flat
+history the truth equals the last read, so the baseline's narrow band is
+near-optimal and our honest granularity widening adds a little loss — still
+under the 0.0085 ceiling. The spread was implemented to spec, not tuned.
 
-- an **exact reimplementation of the documented metric** (pinball `2*max(τd,(τ−1)d)`,
-  `d = logit(y)−logit(q)`, clamp 0.01..99.99, half-up 4 decimals). Verified against the
-  RULES worked example: loss **0.403404**, typical miss 7, coverage 0.5 — exact match.
-  The persistence fallback also reproduces the published practice row for id 4
-  digit-for-digit: `[0.8974, 1.012, 1.1, 1.1955, 1.3477]`.
-- a **labelled reconstruction of the practice answer reads**, not the sealed answers:
-  RULES documents the 04:30Z refresh exactly (players_tracked 638 → **3868**, every rate
-  but the 100% one lower). Pre-refresh earn counts are exact integers (`rate*638/100`,
-  summing to the page's `trophies_earned = 943` — checked). The only unknown is numerator
-  growth `g` between the stale snapshot and the refresh; `g` was calibrated so the
-  persistence baseline reproduces its **published practice loss ≈ 1.51**: `g = 1.20`
-  gives baseline **1.497029**. p01's answer is taken as the same refreshed page (no
-  second refresh documented). These numbers are reconstruction-relative, not official
-  grades; the model was checked across the whole plausible `g` range so nothing is tuned
-  to one guess.
+## Why a flat history does not drift
 
-Practice losses (mean over p00+p01, reconstruction above):
-
-| attempt | change | loss (g=1.20) | verdict |
-|---|---|---|---|
-| 0 | house baseline / starter persistence | 1.497029 | reference (published ≈1.51) |
-| 1 | trend + shrinkage + drift cap + tier prior + residual spread (steps 1–5) | 1.497029 | no effect on practice: flat histories ⇒ slope 0, tier steps 0 ⇒ exactly the baseline's rows. Kept for the final, where histories are dynamic. |
-| 2 | + stale-launch refresh module (step 6) | **0.170233** | kept — ~8.8× lower; median miss 0.014 pp, 90% coverage 0.982 |
-| 3 | robustness sweep g ∈ {1.0, 1.2, 1.4, 1.6} | 0.177 / 0.170 / 0.194 / 0.224 | kept, no parameter change: beats baseline (1.688 / 1.497 / 1.366 / 1.212) at every g |
-
-Final-case mechanics (no final data exists locally before the deadline): smoke-tested on
-a synthetic dynamic case (30 ten-minute reads, rising/falling/flat trophies, growing
-players_tracked, 6510-minute horizon): all 55 rows valid, zero drift-cap violations,
-refresh gate correctly off. This validates mechanics only — it is not a tuning target.
-
-Runtime: **135 ms** wall for both practice cases (`python3 -P -s`, 8 s cap). Outputs
-2,803 / 2,779 bytes (65,536 cap), shape checks pass.
-
-## Rejected
-
-- **Hardcoding the reconstructed answer rates** — overfits a guess and cannot generalize
-  to the final; the refresh module instead derives the shift from case-observable facts
-  (staleness, release date, population size).
-- **Median shift on dynamic histories** — would wreck the final; the refresh gate
-  requires a wholly unchanged page plus launch youth.
-- **Median-absolute step as the tier spread** (as literally prescribed) — it is 0 whenever
-  >50% of consecutive reads are unchanged, which is exactly the refresh-jump regime;
-  RMS of gap-normalized steps keeps the jumps' energy and still floors at the baseline.
-- **Raw (unshrunk, uncapped) extrapolation** — an 80-minute window extrapolated 4.5 days
-  is ~80× leverage; shrinkage + t-gate + ±1.2√d cap contain it.
-- **Equal quantiles / narrow bands** — pinball on the logit scale punishes over-confidence
-  more than honest width; the refresh spread carries the growth uncertainty explicitly.
-- **Forecasting the 100% trophy below 99.99** — the scorer clamps y=100 to 99.99
-  (logit 9.21); a median at 99.95 would cost ~3.9 logit units for nothing. Pinned at
-  99.99, spread 0.2.
-
-## Reproduce
-
-```
-mkdir -p /tmp/in /tmp/out
-cp <kit>/input/p00.in <kit>/input/p01.in /tmp/in/
-MAKEFUN_INPUT_DIR=/tmp/in MAKEFUN_OUTPUT_DIR=/tmp/out python3 -P -s main.py
-```
-
-(The repo ships no `input/` — the grader supplies the case; practice inputs live in the
-kit. Scorer/reconstruction scripts were kept out of the repository, in the session
-scratch dir.)
+In p00/p01 every read is identical, so each trophy's logit series is constant.
+A weighted least-squares line through a constant series has slope 0 and fits
+that same constant at every x, including `target`: `fit = lg(last_rate)`, hence
+`drift = 0` (the code also short-circuits `max(ys)==min(ys)` to exactly 0).
+With `drift=0` the shrinkage and cap are irrelevant and
+`median = lg(last_rate)`, so `q50` rounds back to the last read's rate exactly.
+The lone 100% trophy is an all-boundary series: it emits `lg(100)=lg(99.95)`
+with `base_sigma`, pinning `q50` at 99.95 (0.05% off, within tolerance). There
+is no staleness/launch-growth heuristic anywhere — nothing can move the median
+off a frozen page.
